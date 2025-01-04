@@ -1,0 +1,9 @@
+*.cdi
+*.bin
+*.o
+*.elf
+*.BIN
+cd/*.bin
+cd/*.BIN
+src/*.old
+*.iso
