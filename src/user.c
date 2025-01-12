@@ -12,6 +12,7 @@
 #include <SDL/SDL_dreamcast.h>
 #include <dc/maple.h>
 #include <dc/maple/controller.h>
+#include <arch/cache.h>
 #endif
 #include <stdio.h>
 
@@ -25,7 +26,7 @@
 #include <stdarg.h>
 
 
-
+#include "dc.h"
 
 // We assume you have a "font_drawing.h" that declares print_string(...).
 // That function draws an 8×8 font onto a 16-bpp buffer at (x, y) with fg/bg.
@@ -55,7 +56,7 @@ static float safe_sqrt(float x) {
 }
 #else
 #define safe_exp expf
-#define safe_sqrt sqrtf
+#define safe_sqrt SQRTF_REAL
 #endif
 
 static void log_debug(const char* format, ...) {
@@ -302,16 +303,20 @@ void free_transformer(Transformer* t){
     free_run_state(&t->state);
 }
 
-static float safe_sqrtf(float v){
-    if(v<=0) return 0;
-    return sqrtf(v);
-}
 void rmsnorm(float* o,float* x,float*w,int size){
     float ss=0.f;
-    for(int j=0;j<size;j++){ ss+= x[j]*x[j]; }
+    for(int j=0;j<size;j++)
+    { 
+		//ss+= x[j]*x[j]; 
+		ss = FMAC(x[j], x[j], ss); 
+	}
     ss/= size;
+    //ss = DIVIDE_REAL(size, ss);
+    
     ss+= REAL_EPSILON;
-    float scale= 1.f/safe_sqrtf(ss);
+    //float scale= 1.f/sqrtf(ss);
+    float scale = FSSRA_REAL(ss);
+    
     for(int j=0;j<size;j++){
         o[j]= x[j]* scale * w[j];
     }
@@ -330,16 +335,48 @@ void softmax(float*x,int size){
         x[i]/= sum;
     }
 }
-void matmul(float*xout,float*x,float*w,int n,int d){
-    for(int i=0;i<d;i++){
-        float val=0.f;
-        size_t off= i*(size_t)n;
-        for(int j=0;j<n;j++){
-            val+= w[off+j]* x[j];
+
+#define ALIGN16 __attribute__((aligned(16)))
+
+#define PREFETCH(addr) __builtin_prefetch(addr)
+
+void matmul( float *xout,  const float *x,  const float *w, int n, int d) {
+    int i = 0;
+    for (int i = 0; i < d; i++) {
+        float val0 = 0.0f;
+        float val1 = 0.0f;
+        float val2 = 0.0f;
+        float val3 = 0.0f;
+
+        size_t off = (size_t)i * n;
+
+        dcache_alloc_block(&xout[i], i);
+
+        int j;
+        for (j = 0; j <= n - 4; j += 4) {
+            __builtin_prefetch(&x[j + 8]);
+            __builtin_prefetch(&w[off + j + 8]);
+
+            // Perform FMAC operations
+            val0 = fmaf(x[j],     w[off + j],     val0);
+            val1 = fmaf(x[j + 1], w[off + j + 1], val1);
+            val2 = fmaf(x[j + 2], w[off + j + 2], val2);
+            val3 = fmaf(x[j + 3], w[off + j + 3], val3);
         }
-        xout[i]= val;
+
+        // Handle remaining elements
+        for (; j < n; j++) {
+            val0 = fmaf(x[j], w[off + j], val0);
+        }
+
+        // Sum the accumulated values
+        float sum = val0 + val1 + val2 + val3;
+
+        // Store the result to xout[i]
+        xout[i] = sum;
     }
 }
+
 
 float* forward(Transformer* t,int token,int pos){
     Config* p= &t->config;
@@ -347,14 +384,14 @@ float* forward(Transformer* t,int token,int pos){
     RunState* s= &t->state;
     float* x= s->x;
     int dim= p->dim;
-    int kv_dim= (p->dim*p->n_kv_heads)/ p->n_heads;
-    int kv_mul= p->n_heads/ p->n_kv_heads;
+    int kv_dim= DIVIDE_REAL((p->dim*p->n_kv_heads), p->n_heads);
+    int kv_mul= DIVIDE_REAL(p->n_heads, p->n_kv_heads);
     int hidden_dim= p->hidden_dim;
-    int head_size= dim/p->n_heads;
+    int head_size= DIVIDE_REAL(dim,p->n_heads);
 
     // embedding
     float* embedRow= w->token_embedding_table + token*(size_t)dim;
-    memcpy(x, embedRow, dim*sizeof(*x));
+    MEMCPY_REAL(x, embedRow, dim*sizeof(*x));
 
     for(int l=0;l<p->n_layers;l++){
         // att norm
@@ -373,7 +410,7 @@ float* forward(Transformer* t,int token,int pos){
         // rope
         for(int i=0;i<dim;i+=2){
             int hd= i% head_size;
-            float freq= 1.0f/ powf(10000.f, hd/(float)head_size);
+            float freq= 1.0f/ powf(10000.f, DIVIDE_REAL(hd,(float)head_size));
             float val= pos*freq;
             float c= cosf(val), s2= sinf(val);
             if(i< kv_dim){
@@ -396,19 +433,21 @@ float* forward(Transformer* t,int token,int pos){
                 float*kk= s->key_cache + loff + t*kv_dim + (h/kv_mul)* head_size;
                 float sc=0.f;
                 for(int i=0;i< head_size;i++){
-                    sc+= qq[i]* kk[i];
+					sc = FMAC(kk[i], qq[i], sc);
+                    //sc+= qq[i]* kk[i];
                 }
-                sc/= sqrtf(head_size);
+                sc/= SQRTF_REAL(head_size);
                 att[t]= sc;
             }
             softmax(att, pos+1);
             float*xb= s->xb+ h*head_size;
-            memset(xb,0, head_size*sizeof(float));
+            MEMSET_REAL(xb,0, head_size*sizeof(float));
             for(int t=0;t<=pos;t++){
                 float*vv= s->value_cache + loff + t*kv_dim + (h/kv_mul)* head_size;
                 float a= att[t];
                 for(int i=0;i< head_size;i++){
-                    xb[i]+= a* vv[i];
+                    //xb[i]+= a* vv[i];
+                    xb[i] = FMAC(vv[i],a,xb[i]);
                 }
             }
         }
@@ -669,7 +708,7 @@ int sample(Sampler*s, float* logits){
         nx= sample_argmax(logits, s->vocab_size);
     } else {
         for(int i=0;i<s->vocab_size;i++){
-            logits[i]/= s->temperature;
+            DIVIDE_REAL(s->temperature,logits[i]);
         }
         softmax(logits, s->vocab_size);
         float c= random_f32(&s->rng_state);
@@ -682,7 +721,7 @@ int sample(Sampler*s, float* logits){
     return nx;
 }
 
-long time_in_ms(){
+static inline long time_in_ms(){
     struct timespec tm; clock_gettime(CLOCK_REALTIME,&tm);
     return tm.tv_sec*1000 + tm.tv_nsec/1000000;
 }
@@ -724,7 +763,7 @@ void generate(Transformer*tx,Tokenizer*tz,Sampler*sm,
     }
 	if(pos>1){
         en= time_in_ms();
-        float rate= (pos-1)/ ((float)(en-st)/1000.f);
+        float rate= DIVIDE_REAL((pos-1), ((float)(en-st)/1000.f));
         char sbuf[64]; sprintf(sbuf,"\n(%.2f tokens/s)\n", rate);
         strncat(outbuf,sbuf,outsz- strlen(outbuf)-1);
     }
@@ -898,7 +937,7 @@ static void keyboard_select_key(const char* key){
         // do real Llama inference
         generate(&gTransformer, &gTokenizer, &gSampler,
                  gUserInput, 640, gModelOutput,sizeof(gModelOutput));
-        memset(gUserInput,0,sizeof(gUserInput));
+        MEMSET_REAL(gUserInput,0,sizeof(gUserInput));
         gUIState=1;
     } else if(strcmp(key,"[SPACE]")==0){
         int len= strlen(gUserInput);
@@ -966,8 +1005,8 @@ int main(int argc, char*argv[]){
         }
     }
 
-    memset(gUserInput,0,sizeof(gUserInput));
-    memset(gModelOutput,0,sizeof(gModelOutput));
+    MEMSET_REAL(gUserInput,0,sizeof(gUserInput));
+    MEMSET_REAL(gModelOutput,0,sizeof(gModelOutput));
 
     int running=1;
     while(running){

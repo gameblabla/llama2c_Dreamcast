@@ -1,29 +1,64 @@
-CC	= kos-cc
-CXX	= kos-c++
+# Compiler Definitions
+CC      = kos-cc
+CXX     = kos-c++
 
-CFLAGS		+= -DLSB_FIRST -DALIGN_DWORD -DDREAMCAST -DNOMUTEX -Ofast
-CFLAGS		+= -Isrc
-CXXFLAGS =  $(CFLAGS) -std=gnu17 -fno-exceptions -fno-rtti
+# Compiler Flags
+CFLAGS      += -DLSB_FIRST -DALIGN_DWORD -DDREAMCAST -DNOMUTEX -Ofast -std=gnu11 -flto
+CFLAGS      += -Isrc -Isrc/dc
+CXXFLAGS    = $(CFLAGS) -std=gnu17 -fno-exceptions -fno-rtti
 
-#LDFLAGS = -lSDL -ltremor -lm -lz
-
-#Including OPUS Libraries
+# Linker Flags
 LDFLAGS = -lc -lm -lSDL -lz -s -flto -Wl,--as-needed -Wl,--gc-sections
+
+# Output Executable
 OUTPUT = llama_dc.elf
 
-SRCDIR		=  ./src
-VPATH		= $(SRCDIR)
-SRC_C		= $(foreach dir, $(SRCDIR), $(wildcard $(dir)/*.c))
-SRC_CP		= $(foreach dir, $(SRCDIR), $(wildcard $(dir)/*.cpp))
-OBJ_C		= $(notdir $(patsubst %.c, %.o, $(SRC_C)))
-OBJ_CP		= $(notdir $(patsubst %.cpp, %.o, $(SRC_CP)))
-OBJS		= $(OBJ_C) $(OBJ_CP)
+# Source Directories
+SRCDIR      = ./src ./src/dc
+VPATH       = $(SRCDIR)
 
-all: ${OUTPUT}
+# Source Files
+SRC_C       = $(foreach dir, $(SRCDIR), $(wildcard $(dir)/*.c))
+SRC_CP      = $(foreach dir, $(SRCDIR), $(wildcard $(dir)/*.cpp))
 
-${OUTPUT}: ${OBJS}
-	${CXX} ${CXXFLAGS} -o ${OUTPUT} ${OBJS} ${LDFLAGS} 
+# Object Files
+OBJ_C       = $(notdir $(patsubst %.c, %.o, $(SRC_C)))
+OBJ_CP      = $(notdir $(patsubst %.cpp, %.o, $(SRC_CP)))
+OBJS        = $(OBJ_C) $(OBJ_CP)
 
+# Assembly Files
+ASM_S       = $(patsubst %.c, %.s, $(SRC_C)) $(patsubst %.cpp, %.s, $(SRC_CP))
+
+# Assembly Generation Flags for C and C++ (Lower Optimization, No LTO)
+ASFLAGS_C    = -O0 -std=gnu11 -S
+ASFLAGS_CPP  = -O0 -std=gnu17 -S -fno-exceptions -fno-rtti
+
+# Default Target
+all: $(OUTPUT) asm
+
+# Linking the Final Executable
+$(OUTPUT): $(OBJS)
+	$(CXX) $(CXXFLAGS) -o $(OUTPUT) $(OBJS) $(LDFLAGS)
+
+# Pattern Rule to Compile C Source Files to Object Files
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# Pattern Rule to Compile C++ Source Files to Object Files
+%.o: %.cpp
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+# Pattern Rules to Generate Assembly Files from C and C++ Source Files
+%.s: %.c
+	$(CC) $(CFLAGS) $(ASFLAGS_C) $< -o $@
+
+%.s: %.cpp
+	$(CXX) $(CXXFLAGS) $(ASFLAGS_CPP) $< -o $@
+
+# Target to Generate All Assembly Files
+asm: $(ASM_S)
+
+# Packaging Targets
 pack_unused_cdda:
 	rm -f IP.BIN
 	sh-elf-objcopy -R .stack -O binary $(OUTPUT) main.bin
@@ -31,7 +66,7 @@ pack_unused_cdda:
 	makeip ip.txt IP.BIN
 	mkisofs -C 0,$(shell lbacalc track1.raw track2.raw track3.raw) -V OVERHEATED -G IP.BIN -joliet -rock -l -o "llama.iso" ./cd
 	mds4dc -c llama.mds llama.iso track1.raw track2.raw track3.raw
-	
+
 pack:
 	rm -f IP.BIN
 	sh-elf-objcopy -R .stack -O binary $(OUTPUT) main.bin
@@ -39,6 +74,7 @@ pack:
 	makeip ip.txt IP.BIN
 	mkisofs -V llama -G IP.BIN -joliet -rock -l -x cd -o "llama.iso" ./cd
 	cdi4dc llama.iso llama.cdi -d
-	
+
+# Clean Target to Remove Generated Files
 clean:
-	rm *.o *.img src/*.o src/sdl/*.o src/dc/*.o src/enemies/*.o ${OUTPUT} *.BIN *.iso *.mds *.mdf
+	rm -f *.o *.img src/*.o src/sdl/*.o src/dc/*.o src/enemies/*.o $(OUTPUT) *.BIN *.iso *.mds *.mdf *.s
